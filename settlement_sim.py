@@ -86,6 +86,159 @@ class Settlement:
         return self.population * self.defense * self.tech_level
 
 
+class MapGenerator:
+    """
+    Generates terrain by seeding feature types and growing them through
+    neighbor-influenced spread.  No hard structural assumptions are made
+    about the shape of fjords, mountain ranges, or forests: each feature
+    starts from random seed cells and expands with a probability that
+    scales with the number of already-converted neighbours.
+
+    Ocean is special: it is always present on the border and additionally
+    seeded along the border to form inlets.  Mountains and forests are
+    seeded in the interior and spread only onto PLAINS.
+    """
+
+    # Spread probabilities per neighbour count are determined by a single
+    # per-feature parameter p: P(cell converts | k neighbours) = 1-(1-p)^k
+    _OCEAN_SPREAD    = 0.40
+    _MOUNTAIN_SPREAD = 0.28
+    _FOREST_SPREAD   = 0.42
+
+    def __init__(self, rng: random.Random, width: int, height: int):
+        self.rng = rng
+        self.width = width
+        self.height = height
+
+    def generate(self) -> tuple[np.ndarray, list["Settlement"]]:
+        """Return (grid, initial_settlements)."""
+        W, H = self.width, self.height
+        grid = np.full((H, W), PLAINS, dtype=np.int32)
+
+        # Hard ocean border
+        grid[0, :] = grid[-1, :] = grid[:, 0] = grid[:, -1] = OCEAN
+
+        # Ocean inlets — seed along the border, let them grow inward
+        n_inlet_seeds = self.rng.randint(4, 10)
+        for _ in range(n_inlet_seeds):
+            self._seed_border(grid, OCEAN)
+        self._spread(grid, OCEAN, self._OCEAN_SPREAD,
+                     iterations=self.rng.randint(3, 7))
+
+        # Mountain clusters — seeded in the interior
+        n_mountain_seeds = self.rng.randint(4, 10)
+        for _ in range(n_mountain_seeds):
+            x = self.rng.randint(3, W - 4)
+            y = self.rng.randint(3, H - 4)
+            grid[y, x] = MOUNTAIN
+        self._spread(grid, MOUNTAIN, self._MOUNTAIN_SPREAD,
+                     iterations=self.rng.randint(2, 5),
+                     only_on={PLAINS})
+
+        # Forest patches — seeded anywhere on PLAINS
+        n_forest_seeds = self.rng.randint(12, 28)
+        for _ in range(n_forest_seeds):
+            x = self.rng.randint(1, W - 2)
+            y = self.rng.randint(1, H - 2)
+            if grid[y, x] == PLAINS:
+                grid[y, x] = FOREST
+        self._spread(grid, FOREST, self._FOREST_SPREAD,
+                     iterations=self.rng.randint(1, 3),
+                     only_on={PLAINS})
+
+        settlements = self._place_settlements(grid)
+        return grid, settlements
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _seed_border(self, grid: np.ndarray, terrain: int):
+        """Place one seed of *terrain* at a random point on the border."""
+        W, H = self.width, self.height
+        edge = self.rng.choice(['top', 'bottom', 'left', 'right'])
+        if edge == 'top':
+            x, y = self.rng.randint(1, W - 2), 0
+        elif edge == 'bottom':
+            x, y = self.rng.randint(1, W - 2), H - 1
+        elif edge == 'left':
+            x, y = 0, self.rng.randint(1, H - 2)
+        else:
+            x, y = W - 1, self.rng.randint(1, H - 2)
+        grid[y, x] = terrain
+
+    def _spread(self, grid: np.ndarray, terrain: int, spread_prob: float,
+                iterations: int, only_on: set | None = None):
+        """
+        Iteratively expand *terrain* to neighbouring cells.
+        A candidate cell with k neighbours already of *terrain* converts
+        with probability  1 - (1 - spread_prob)^k.
+        *only_on* restricts which current terrain types can be overwritten.
+        """
+        W, H = self.width, self.height
+        DIRS = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
+
+        for _ in range(iterations):
+            candidates: list[tuple[int, int, float]] = []
+            for y in range(1, H - 1):
+                for x in range(1, W - 1):
+                    if grid[y, x] == terrain:
+                        continue
+                    if only_on is not None and grid[y, x] not in only_on:
+                        continue
+                    k = sum(
+                        1 for dx, dy in DIRS
+                        if 0 <= x + dx < W and 0 <= y + dy < H
+                        and grid[y + dy, x + dx] == terrain
+                    )
+                    if k > 0:
+                        candidates.append((x, y, 1.0 - (1.0 - spread_prob) ** k))
+
+            for x, y, p in candidates:
+                if self.rng.random() < p:
+                    grid[y, x] = terrain
+
+    def _place_settlements(self, grid: np.ndarray) -> list["Settlement"]:
+        W, H = self.width, self.height
+        DIRS = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
+
+        candidates = [
+            (x, y)
+            for y in range(H) for x in range(W)
+            if grid[y, x] in PASSABLE
+        ]
+        self.rng.shuffle(candidates)
+
+        placed: list[tuple[int, int]] = []
+        settlements: list[Settlement] = []
+        min_dist = 6
+
+        for x, y in candidates:
+            if all(abs(x - px) + abs(y - py) >= min_dist for px, py in placed):
+                is_coastal = any(
+                    0 <= x + dx < W and 0 <= y + dy < H
+                    and grid[y + dy, x + dx] == OCEAN
+                    for dx, dy in DIRS
+                )
+                s = Settlement(
+                    x=x, y=y,
+                    population=self.rng.uniform(2.0, 4.0),
+                    food=self.rng.uniform(2.0, 5.0),
+                    wealth=self.rng.uniform(1.0, 3.0),
+                    defense=self.rng.uniform(0.3, 0.7),
+                    tech_level=1.0,
+                    has_port=is_coastal and self.rng.random() < 0.5,
+                    owner_id=len(placed),
+                )
+                grid[y, x] = PORT if s.has_port else SETTLE
+                settlements.append(s)
+                placed.append((x, y))
+                if len(placed) >= 12:
+                    break
+
+        return settlements
+
+
 class AstarWorld:
     def __init__(self, seed: int, params: SimParams, width=40, height=40):
         self.seed = seed
@@ -98,122 +251,8 @@ class AstarWorld:
         self.settlements: list[Settlement] = []
         self.ruin_ages: dict[tuple, int] = {}  # (x,y) → years as ruin
 
-        self._generate_map()
-
-    # ------------------------------------------------------------------
-    # Map generation
-    # ------------------------------------------------------------------
-
-    def _generate_map(self):
-        g = self.grid
-        W, H = self.width, self.height
-
-        # Ocean border
-        g[:, :] = PLAINS
-        g[0, :] = g[-1, :] = g[:, 0] = g[:, -1] = OCEAN
-
-        # Fjords: cut inland from random edges
-        for _ in range(self.rng.randint(2, 5)):
-            self._carve_fjord()
-
-        # Mountain chains via random walk
-        for _ in range(self.rng.randint(2, 4)):
-            self._place_mountain_chain()
-
-        # Forest patches
-        for _ in range(self.rng.randint(8, 16)):
-            self._place_forest_patch()
-
-        # Initial settlements
-        self._place_initial_settlements()
-
-    def _carve_fjord(self):
-        # Pick a random ocean-border entry point and walk inland
-        edge = self.rng.choice(['top', 'bottom', 'left', 'right'])
-        W, H = self.width, self.height
-        if edge == 'top':
-            x, y = self.rng.randint(1, W-2), 0
-            dx, dy = 0, 1
-        elif edge == 'bottom':
-            x, y = self.rng.randint(1, W-2), H-1
-            dx, dy = 0, -1
-        elif edge == 'left':
-            x, y = 0, self.rng.randint(1, H-2)
-            dx, dy = 1, 0
-        else:
-            x, y = W-1, self.rng.randint(1, H-2)
-            dx, dy = -1, 0
-
-        length = self.rng.randint(4, 12)
-        for _ in range(length):
-            x += dx + self.rng.randint(-1, 1)
-            y += dy + self.rng.randint(-1, 1)
-            if 0 <= x < W and 0 <= y < H:
-                self.grid[y, x] = OCEAN
-                # widen slightly
-                for nx, ny in self._neighbors(x, y):
-                    if self.rng.random() < 0.4:
-                        self.grid[ny, nx] = OCEAN
-
-    def _place_mountain_chain(self):
-        W, H = self.width, self.height
-        x, y = self.rng.randint(5, W-5), self.rng.randint(5, H-5)
-        length = self.rng.randint(6, 15)
-        dx, dy = self.rng.choice([(1,0),(0,1),(1,1),(-1,1)])
-        for _ in range(length):
-            if 0 < x < W-1 and 0 < y < H-1:
-                self.grid[y, x] = MOUNTAIN
-                if self.rng.random() < 0.5:
-                    nx, ny = x + self.rng.randint(-1,1), y + self.rng.randint(-1,1)
-                    if 0 < nx < W-1 and 0 < ny < H-1:
-                        self.grid[ny, nx] = MOUNTAIN
-            x += dx + self.rng.randint(-1, 1)
-            y += dy + self.rng.randint(-1, 1)
-
-    def _place_forest_patch(self):
-        W, H = self.width, self.height
-        cx, cy = self.rng.randint(2, W-3), self.rng.randint(2, H-3)
-        radius = self.rng.randint(2, 5)
-        for dy in range(-radius, radius+1):
-            for dx in range(-radius, radius+1):
-                if dx*dx + dy*dy <= radius*radius:
-                    nx, ny = cx+dx, cy+dy
-                    if 0 < nx < W-1 and 0 < ny < H-1:
-                        if self.grid[ny, nx] == PLAINS and self.rng.random() < 0.7:
-                            self.grid[ny, nx] = FOREST
-
-    def _place_initial_settlements(self):
-        W, H = self.width, self.height
-        candidates = [
-            (x, y)
-            for y in range(H) for x in range(W)
-            if self.grid[y, x] in PASSABLE
-        ]
-        self.rng.shuffle(candidates)
-        placed = []
-        min_dist = 6
-
-        for x, y in candidates:
-            if all(abs(x-px) + abs(y-py) >= min_dist for px, py in placed):
-                is_coastal = any(
-                    self.grid[ny, nx] == OCEAN
-                    for nx, ny in self._neighbors(x, y)
-                )
-                s = Settlement(
-                    x=x, y=y,
-                    population=self.rng.uniform(2.0, 4.0),
-                    food=self.rng.uniform(2.0, 5.0),
-                    wealth=self.rng.uniform(1.0, 3.0),
-                    defense=self.rng.uniform(0.3, 0.7),
-                    tech_level=1.0,
-                    has_port=is_coastal and self.rng.random() < 0.5,
-                    owner_id=len(placed),
-                )
-                self.grid[y, x] = PORT if s.has_port else SETTLE
-                self.settlements.append(s)
-                placed.append((x, y))
-                if len(placed) >= 12:
-                    break
+        gen = MapGenerator(self.rng, width, height)
+        self.grid, self.settlements = gen.generate()
 
     # ------------------------------------------------------------------
     # Simulation phases
