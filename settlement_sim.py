@@ -52,6 +52,43 @@ class SimParams:
     reclaim_prob_per_year: float = 0.15
     forest_regrowth_prob: float = 0.05      # ruin → forest if isolated
 
+    # Conflict — fractional effects (mean + std for Gaussian draws)
+    loot_food_frac: float = 0.30
+    loot_food_frac_std: float = 0.08
+    loot_wealth_frac: float = 0.20
+    loot_wealth_frac_std: float = 0.06
+    raid_defense_damage: float = 0.15       # fractional defense lost by defender
+    raid_defense_damage_std: float = 0.05
+    raid_pop_damage: float = 0.10           # fractional population lost by defender
+    raid_pop_damage_std: float = 0.04
+    failed_raid_pop_damage: float = 0.08    # fractional population lost by failed attacker
+    failed_raid_pop_damage_std: float = 0.03
+    conquest_defense_threshold: float = 0.20
+
+    # Winter
+    harsh_winter_mult_lo: float = 2.0
+    harsh_winter_mult_hi: float = 3.0
+
+    # Growth
+    port_wealth_threshold: float = 2.0
+    found_port_prob: float = 0.40           # prob new coastal settlement gets a port
+    found_settlement_radius: int = 3
+
+    # Collapse
+    collapse_dispersal_frac: float = 0.50   # fraction of pop dispersed to neighbours
+    collapse_dispersal_frac_std: float = 0.10
+    collapse_dispersal_radius: int = 6
+
+    # Environment / reclaim
+    patron_search_radius: int = 4
+    patron_pop_frac: float = 0.70           # fraction of expansion_pop_threshold needed to be a patron
+    forest_regrowth_min_age: int = 5
+
+    # Reclaim
+    reclaim_pop_frac: float = 0.50
+    reclaim_wealth_frac: float = 0.50
+    reclaim_defense_frac: float = 0.70
+
 
 @dataclass
 class Settlement:
@@ -240,19 +277,23 @@ class MapGenerator:
 
 
 class AstarWorld:
-    def __init__(self, seed: int, params: SimParams, width=40, height=40):
+    def __init__(self, seed: int, params: SimParams, width=40, height=40,
+                 initial_grid: Optional[np.ndarray] = None,
+                 initial_settlements: Optional[list] = None):
         self.seed = seed
         self.params = params
         self.width = width
         self.height = height
         self.rng = random.Random(seed)
         self.np_rng = np.random.default_rng(seed)
-        self.grid = np.zeros((height, width), dtype=np.int32)
-        self.settlements: list[Settlement] = []
         self.ruin_ages: dict[tuple, int] = {}  # (x,y) → years as ruin
 
-        gen = MapGenerator(self.rng, width, height)
-        self.grid, self.settlements = gen.generate()
+        if initial_grid is not None:
+            self.grid = initial_grid.copy()
+            self.settlements = list(initial_settlements or [])
+        else:
+            gen = MapGenerator(self.rng, width, height)
+            self.grid, self.settlements = gen.generate()
 
     # ------------------------------------------------------------------
     # Simulation phases
@@ -286,7 +327,7 @@ class AstarWorld:
 
             # Port development
             if not s.has_port and self._is_coastal(s.x, s.y):
-                if s.wealth > 2.0 and self.rng.random() < p.port_build_prob:
+                if s.wealth > p.port_wealth_threshold and self.rng.random() < p.port_build_prob:
                     s.has_port = True
                     self.grid[s.y, s.x] = PORT
 
@@ -332,21 +373,21 @@ class AstarWorld:
 
             if self.rng.random() < win_prob:
                 # Raid succeeds
-                loot_food   = target.food * 0.3
-                loot_wealth = target.wealth * 0.2
+                loot_food   = target.food   * self._gauss_frac(p.loot_food_frac,   p.loot_food_frac_std)
+                loot_wealth = target.wealth * self._gauss_frac(p.loot_wealth_frac, p.loot_wealth_frac_std)
                 attacker.food   += loot_food
                 attacker.wealth += loot_wealth
                 target.food     -= loot_food
                 target.wealth   -= loot_wealth
-                target.defense  *= 0.85
-                target.population *= 0.9
+                target.defense    *= 1.0 - self._gauss_frac(p.raid_defense_damage, p.raid_defense_damage_std)
+                target.population *= 1.0 - self._gauss_frac(p.raid_pop_damage,    p.raid_pop_damage_std)
 
                 # Conquest
-                if target.defense < 0.2 and self.rng.random() < p.conquest_prob:
+                if target.defense < p.conquest_defense_threshold and self.rng.random() < p.conquest_prob:
                     target.owner_id = attacker.owner_id
             else:
                 # Failed raid — attacker takes losses
-                attacker.population *= 0.92
+                attacker.population *= 1.0 - self._gauss_frac(p.failed_raid_pop_damage, p.failed_raid_pop_damage_std)
 
     def _phase_trade(self):
         p = self.params
@@ -373,7 +414,7 @@ class AstarWorld:
         # Draw this year's severity
         severity = abs(self.np_rng.normal(p.winter_base_severity, p.winter_severity_std))
         if self.rng.random() < p.harsh_winter_prob:
-            severity *= self.rng.uniform(2.0, 3.0)
+            severity *= self.rng.uniform(p.harsh_winter_mult_lo, p.harsh_winter_mult_hi)
 
         for s in self.settlements:
             if not s.alive:
@@ -394,13 +435,13 @@ class AstarWorld:
             # Check for nearby patron
             patrons = [
                 s for s in live
-                if self._chebyshev_xy(s.x, s.y, rx, ry) <= 4
-                and s.population > p.expansion_pop_threshold * 0.7
+                if self._chebyshev_xy(s.x, s.y, rx, ry) <= p.patron_search_radius
+                and s.population > p.expansion_pop_threshold * p.patron_pop_frac
             ]
             if patrons and self.rng.random() < p.reclaim_prob_per_year:
                 patron = max(patrons, key=lambda s: s.population)
                 self._reclaim_ruin(rx, ry, patron)
-            elif age > 5 and self.rng.random() < p.forest_regrowth_prob:
+            elif age > p.forest_regrowth_min_age and self.rng.random() < p.forest_regrowth_prob:
                 self.grid[ry, rx] = FOREST
                 del self.ruin_ages[(rx, ry)]
 
@@ -414,20 +455,22 @@ class AstarWorld:
         self.ruin_ages[(s.x, s.y)] = 0
 
         # Disperse population to nearby friendlies
+        p = self.params
         neighbors = [
             t for t in self.settlements
             if t.alive and t.owner_id == s.owner_id
-            and self._chebyshev(s, t) <= 6
+            and self._chebyshev(s, t) <= p.collapse_dispersal_radius
         ]
         if neighbors:
-            share = s.population * 0.5 / len(neighbors)
+            share = s.population * self._gauss_frac(p.collapse_dispersal_frac, p.collapse_dispersal_frac_std) / len(neighbors)
             for t in neighbors:
                 t.population += share
 
     def _found_settlement(self, patron: Settlement):
+        p = self.params
         candidates = [
             (x, y)
-            for nx, ny in self._neighbors_radius(patron.x, patron.y, 3)
+            for nx, ny in self._neighbors_radius(patron.x, patron.y, p.found_settlement_radius)
             for x, y in [(nx, ny)]
             if self.grid[y, x] in PASSABLE
             and not any(s.x == x and s.y == y for s in self.settlements)
@@ -435,7 +478,6 @@ class AstarWorld:
         if not candidates:
             return
         x, y = self.rng.choice(candidates)
-        p = self.params
         f = p.new_settle_inherit_frac
         is_coastal = self._is_coastal(x, y)
         s = Settlement(
@@ -445,7 +487,7 @@ class AstarWorld:
             wealth=patron.wealth * f,
             defense=patron.defense,
             tech_level=patron.tech_level,
-            has_port=is_coastal and self.rng.random() < 0.4,
+            has_port=is_coastal and self.rng.random() < p.found_port_prob,
             owner_id=patron.owner_id,
         )
         patron.population *= (1 - f * 0.5)
@@ -458,10 +500,10 @@ class AstarWorld:
         is_coastal = self._is_coastal(rx, ry)
         s = Settlement(
             x=rx, y=ry,
-            population=patron.population * f * 0.5,
+            population=patron.population * f * p.reclaim_pop_frac,
             food=patron.food * f,
-            wealth=patron.wealth * f * 0.5,
-            defense=patron.defense * 0.7,
+            wealth=patron.wealth * f * p.reclaim_wealth_frac,
+            defense=patron.defense * p.reclaim_defense_frac,
             tech_level=patron.tech_level,
             has_port=is_coastal,
             owner_id=patron.owner_id,
@@ -469,6 +511,10 @@ class AstarWorld:
         self.grid[ry, rx] = PORT if s.has_port else SETTLE
         self.settlements.append(s)
         del self.ruin_ages[(rx, ry)]
+
+    def _gauss_frac(self, mean: float, std: float) -> float:
+        """Draw a fractional multiplier ~ N(mean, std), clipped to [0, 1]."""
+        return float(np.clip(self.np_rng.normal(mean, std), 0.0, 1.0))
 
     def _neighbors(self, x, y):
         for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]:
